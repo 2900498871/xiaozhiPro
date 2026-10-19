@@ -6,13 +6,16 @@
 #include "cjson_utils.h"
 #include "display.h"
 #include "mcp_server.h"
-#include "mqtt_protocol.h"
 #include "settings.h"
 #include "system_info.h"
 #include "text_glyph_payload.h"
-#include "websocket_protocol.h"
+#include "ai_config.h"
+#include "direct/direct_voice_protocol.h"
+#include "web/config_server.h"
+#include "vision/vision_module.h"
 
 #include <driver/gpio.h>
+#include <esp_app_desc.h>
 #include <esp_log.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
@@ -281,6 +284,15 @@ void Application::Run() {
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
+            // 直连模式：空闲超时后主动断开与 AI 服务商的会话，避免长时间空转。
+            if (clock_ticks_ % 5 == 0 && protocol_ && GetDeviceState() == kDeviceStateIdle) {
+                auto* direct = static_cast<DirectVoiceProtocol*>(protocol_.get());
+                if (direct != nullptr && direct->IsIdleTimedOut()) {
+                    ESP_LOGI(TAG, "Session idle timeout, closing audio channel");
+                    protocol_->CloseAudioChannel();
+                }
+            }
+
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
                 SystemInfo::PrintHeapStats();
@@ -345,7 +357,8 @@ void Application::HandleActivationDoneEvent() {
     SystemInfo::PrintHeapStats();
     SetDeviceState(kDeviceStateIdle);
 
-    has_server_time_ = ota_->HasServerTime();
+    // 直连模式不进行服务器时间同步。
+    has_server_time_ = false;
 
     // Protocol start may have already raised MAIN_EVENT_ERROR. Do not replace
     // that alert with the "ready" UI/sound — the main loop can process both
@@ -357,7 +370,9 @@ void Application::HandleActivationDoneEvent() {
     }
     if (!has_error) {
         auto display = Board::GetInstance().GetDisplay();
-        std::string message = std::string(Lang::Strings::VERSION) + ota_->GetCurrentVersion();
+        const esp_app_desc_t* desc = esp_app_get_description();
+        std::string message = std::string(Lang::Strings::VERSION) +
+                              (desc != nullptr ? desc->version : "unknown");
         display->ShowNotification(message.c_str());
         display->SetChatMessage("system", "");
     }
@@ -379,14 +394,29 @@ void Application::ActivationTask() {
     // Create OTA object for activation process
     ota_ = std::make_unique<Ota>();
 
-    // Check for new assets version
+    // 直连模式：清除服务器模式下发的资源下载地址，避免访问 xiaozhi.me。
+    {
+        Settings assets_settings("assets", true);
+        assets_settings.EraseKey("download_url");
+    }
+
+    // Check for new assets version (local partition only in direct mode)
     CheckAssetsVersion();
 
-    // Check for new firmware version
-    CheckNewVersion();
+    // 直连模式：跳过 OTA/激活请求（CheckNewVersion 会访问 xiaozhi 服务器，
+    // 且失败时会长时间重试，阻塞配置网页启动）。
+    ESP_LOGI(TAG, "Direct mode: skip server version check and activation");
 
     // Initialize the protocol
     InitializeProtocol();
+
+    // 直连模式配套服务：板载配置网页 + 摄像头（开机自启可选）
+    ConfigServerInit(static_cast<DirectVoiceProtocol*>(protocol_.get()));
+    VisionConfig vcfg = VisionConfigLoad();
+    if (vcfg.enable) {
+        ESP_LOGI(TAG, "Vision auto start on boot");
+        VisionModuleStart();
+    }
 
     // Signal completion to main loop
     xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
@@ -548,14 +578,12 @@ void Application::InitializeProtocol() {
 
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
-    if (ota_->HasMqttConfig()) {
-        protocol_ = std::make_unique<MqttProtocol>();
-    } else if (ota_->HasWebsocketConfig()) {
-        protocol_ = std::make_unique<WebsocketProtocol>();
-    } else {
-        ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
-        protocol_ = std::make_unique<MqttProtocol>();
-    }
+    // 纯直连模式（需求 v1.3）：直接实例化 DirectVoiceProtocol
+    // 不使用 MQTT/WebSocket 服务器模式（不连接 xiaozhi.me，无中间服务器）
+    protocol_ = std::make_unique<DirectVoiceProtocol>();
+    // 直连服务商（千问/豆包）接收 PCM16，而不是 Opus。
+    audio_service_.SetSendPcm(true);
+    ESP_LOGI(TAG, "Direct connect mode enabled (provider from web config, no xiaozhi server)");
 
     protocol_->OnConnected([this]() { DismissAlert(); });
 
@@ -565,7 +593,10 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (GetDeviceState() == kDeviceStateSpeaking) {
+        // 直连模式下 TTS start 事件经 Schedule 异步切换状态，首包音频可能在
+        // 状态仍为 Idle 时到达；此时也应入队，否则开头会被丢弃。
+        const auto state = GetDeviceState();
+        if (state == kDeviceStateSpeaking || state == kDeviceStateIdle) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
     });
@@ -1286,6 +1317,29 @@ void Application::Reboot() {
     esp_restart();
 }
 
+void Application::StopConversation() {
+    Schedule([this]() {
+        if (protocol_ == nullptr) return;
+        const auto state = GetDeviceState();
+        if (protocol_->IsAudioChannelOpened()) {
+            protocol_->CloseAudioChannel();
+        }
+        if (state == kDeviceStateListening || state == kDeviceStateSpeaking ||
+            state == kDeviceStateConnecting) {
+            SetDeviceState(kDeviceStateIdle);
+        }
+    });
+}
+
+void Application::SnapAndAnalyze() {
+    Schedule([this]() {
+        auto* protocol = static_cast<DirectVoiceProtocol*>(protocol_.get());
+        if (protocol != nullptr) {
+            protocol->SnapAndAnalyze();
+        }
+    });
+}
+
 bool Application::UpgradeFirmware(const std::string& url, const std::string& version) {
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
@@ -1449,6 +1503,8 @@ void Application::ResetProtocol() {
         if (protocol_ && protocol_->IsAudioChannelOpened()) {
             protocol_->CloseAudioChannel();
         }
+        // 配置服务器持有 protocol 指针，必须先于 protocol 销毁。
+        ConfigServerDeinit();
         // Reset protocol
         protocol_.reset();
     });

@@ -109,6 +109,10 @@ public:
     void StopListening();
 
     void Reboot();
+    // Trigger a single camera snapshot + model analysis on the main task.
+    void SnapAndAnalyze();
+    // End the current conversation (listening or speaking) and close the channel.
+    void StopConversation();
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
     bool CanEnterSleepMode();

@@ -406,9 +406,31 @@ void AudioService::OpusCodecTask() {
             task.playback_id = packet->playback_id;
             task.media_position_ms = packet->media_position_ms;
 
-            SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
+            SetDecodeSampleRate(packet->sample_rate, packet->frame_duration, packet->opus);
             bool decoded = false;
-            if (opus_decoder_ != nullptr) {
+            if (!packet->opus) {
+                /* Direct-connect providers stream raw PCM16; bypass the Opus decoder. */
+                const size_t sample_count = packet->payload.size() / sizeof(int16_t);
+                if (sample_count > 0) {
+                    task.pcm.resize(sample_count);
+                    memcpy(task.pcm.data(), packet->payload.data(),
+                           sample_count * sizeof(int16_t));
+                    if (decoder_sample_rate_ != codec_->output_sample_rate() &&
+                        output_resampler_ != nullptr) {
+                        uint32_t target_size = 0;
+                        esp_ae_rate_cvt_get_max_out_sample_num(output_resampler_, task.pcm.size(),
+                                                               &target_size);
+                        std::vector<int16_t> resampled(target_size);
+                        uint32_t actual_output = target_size;
+                        esp_ae_rate_cvt_process(output_resampler_, (esp_ae_sample_t)task.pcm.data(),
+                                                task.pcm.size(), (esp_ae_sample_t)resampled.data(),
+                                                &actual_output);
+                        resampled.resize(actual_output);
+                        task.pcm = std::move(resampled);
+                    }
+                    decoded = true;
+                }
+            } else if (opus_decoder_ != nullptr) {
                 task.pcm.resize(decoder_frame_size_);
                 esp_audio_dec_in_raw_t raw = {
                     .buffer = (uint8_t*)(packet->payload.data()),
@@ -474,7 +496,16 @@ void AudioService::OpusCodecTask() {
             packet->sample_rate = 16000;
             packet->timestamp = task.timestamp;
 
-            if (opus_encoder_ != nullptr && task.pcm.size() == encoder_frame_size_) {
+            bool packet_ready = false;
+            if (send_pcm_.load()) {
+                /* Direct-connect providers consume raw PCM16. */
+                packet->opus = false;
+                packet->payload.resize(task.pcm.size() * sizeof(int16_t));
+                if (!task.pcm.empty()) {
+                    memcpy(packet->payload.data(), task.pcm.data(), packet->payload.size());
+                    packet_ready = true;
+                }
+            } else if (opus_encoder_ != nullptr && task.pcm.size() == encoder_frame_size_) {
                 packet->payload.resize(encoder_outbuf_size_);
                 esp_audio_enc_in_frame_t in = {
                     .buffer = (uint8_t*)(task.pcm.data()),
@@ -488,31 +519,7 @@ void AudioService::OpusCodecTask() {
                 auto ret = esp_opus_enc_process(opus_encoder_, &in, &out);
                 if (ret == ESP_AUDIO_ERR_OK) {
                     packet->payload.resize(out.encoded_bytes);
-
-                    if (task.type == kAudioTaskTypeEncodeToSendQueue) {
-                        {
-                            std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
-                            /* Never let a full send queue stall encoding: stale realtime
-                             * audio is useless to the server, so drop the oldest packet. */
-                            if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
-                                audio_send_queue_.pop_front();
-                            }
-                            audio_send_queue_.push_back(std::move(packet));
-                        }
-                        if (callbacks_.on_send_queue_available) {
-                            callbacks_.on_send_queue_available();
-                        }
-                    } else if (task.type == kAudioTaskTypeEncodeToTestingQueue) {
-                        bool testing_queue_full = false;
-                        {
-                            std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
-                            testing_queue_full = !audio_testing_queue_.push_back(std::move(packet));
-                        }
-                        if (testing_queue_full && callbacks_.on_audio_testing_queue_full) {
-                            callbacks_.on_audio_testing_queue_full();
-                        }
-                    }
-                    debug_statistics_.encode_count++;
+                    packet_ready = true;
                 } else {
                     ESP_LOGE(TAG, "Failed to encode audio, error code: %d", ret);
                 }
@@ -522,6 +529,33 @@ void AudioService::OpusCodecTask() {
                          "(got %u, expected %u)",
                          task.pcm.size(), encoder_frame_size_);
             }
+
+            if (packet_ready) {
+                if (task.type == kAudioTaskTypeEncodeToSendQueue) {
+                    {
+                        std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
+                        /* Never let a full send queue stall encoding: stale realtime
+                         * audio is useless to the server, so drop the oldest packet. */
+                        if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
+                            audio_send_queue_.pop_front();
+                        }
+                        audio_send_queue_.push_back(std::move(packet));
+                    }
+                    if (callbacks_.on_send_queue_available) {
+                        callbacks_.on_send_queue_available();
+                    }
+                } else if (task.type == kAudioTaskTypeEncodeToTestingQueue) {
+                    bool testing_queue_full = false;
+                    {
+                        std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
+                        testing_queue_full = !audio_testing_queue_.push_back(std::move(packet));
+                    }
+                    if (testing_queue_full && callbacks_.on_audio_testing_queue_full) {
+                        callbacks_.on_audio_testing_queue_full();
+                    }
+                }
+                debug_statistics_.encode_count++;
+            }
             lock.lock();
         }
     }
@@ -529,8 +563,9 @@ void AudioService::OpusCodecTask() {
     ESP_LOGW(TAG, "Opus codec task stopped");
 }
 
-void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
-    if (decoder_sample_rate_ == sample_rate && decoder_duration_ms_ == frame_duration) {
+void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration, bool pcm) {
+    if (decoder_sample_rate_ == sample_rate && decoder_duration_ms_ == frame_duration &&
+        decoder_pcm_ == pcm) {
         return;
     }
     std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
@@ -539,15 +574,21 @@ void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
         opus_decoder_ = nullptr;
     }
     decoder_lock.unlock();
-    esp_opus_dec_cfg_t opus_dec_cfg = OPUS_DEC_CFG(sample_rate, frame_duration);
-    auto ret = esp_opus_dec_open(&opus_dec_cfg, sizeof(esp_opus_dec_cfg_t), &opus_decoder_);
-    if (opus_decoder_ == nullptr) {
-        ESP_LOGE(TAG, "Failed to create audio decoder, error code: %d", ret);
-        return;
+
+    decoder_frame_size_ = frame_duration > 0 ? sample_rate / 1000 * frame_duration : 0;
+    if (!pcm) {
+        esp_opus_dec_cfg_t opus_dec_cfg = OPUS_DEC_CFG(sample_rate, frame_duration);
+        auto ret = esp_opus_dec_open(&opus_dec_cfg, sizeof(esp_opus_dec_cfg_t), &opus_decoder_);
+        if (opus_decoder_ == nullptr) {
+            ESP_LOGE(TAG, "Failed to create audio decoder, error code: %d", ret);
+            // Force a retry on the next packet instead of caching the failed state.
+            decoder_sample_rate_ = 0;
+            return;
+        }
     }
     decoder_sample_rate_ = sample_rate;
     decoder_duration_ms_ = frame_duration;
-    decoder_frame_size_ = decoder_sample_rate_ / 1000 * frame_duration;
+    decoder_pcm_ = pcm;
 
     auto codec = Board::GetInstance().GetAudioCodec();
     if (decoder_sample_rate_ != codec->output_sample_rate()) {
@@ -563,6 +604,9 @@ void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
         if (output_resampler_ == nullptr) {
             ESP_LOGE(TAG, "Failed to create output resampler, error code: %d", resampler_ret);
         }
+    } else if (output_resampler_ != nullptr) {
+        esp_ae_rate_cvt_close(output_resampler_);
+        output_resampler_ = nullptr;
     }
 }
 

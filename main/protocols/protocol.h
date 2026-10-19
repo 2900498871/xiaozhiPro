@@ -13,6 +13,9 @@ struct AudioStreamPacket {
     uint32_t timestamp = 0;
     uint32_t playback_id = 0;
     uint32_t media_position_ms = 0;
+    // true: payload is an Opus frame (server mode / wake-word data).
+    // false: payload is raw PCM16 mono (direct-connect providers).
+    bool opus = true;
     std::vector<uint8_t> payload;
 };
 

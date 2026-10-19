@@ -41,9 +41,18 @@ set(SOURCES "audio/audio_codec.cc"
             "device_state_machine.cc"
             "assets.cc"
             "main.cc"
+            # ---- 直连模式（需求 v1.3）----
+            "ai_config.cc"
+            "direct/direct_voice_protocol.cc"
+            "direct/adapters/qwen_realtime.cc"
+            "direct/adapters/doubao_realtime.cc"
+            "direct/adapters/deepseek_adapter.cc"
+            "web/config_server.cc"
+            "vision/vision_module.cc"
             )
 
-set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols")
+set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols"
+                 "direct" "direct/adapters" "web" "vision")
 
 # Add board common files
 list(APPEND SOURCES
@@ -1119,6 +1128,10 @@ if(CONFIG_BOARD_TYPE_ESP32_P4_FUNCTION_EV_BOARD)
         sdmmc
     )
 endif()
+# Camera is only supported on ESP32-S3 targets (matches idf_component.yml rule).
+if(CONFIG_IDF_TARGET_ESP32S3)
+    list(APPEND MAIN_PRIV_REQUIRES_EXTRA espressif__esp32-camera)
+endif()
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
@@ -1146,6 +1159,11 @@ idf_component_register(SRCS ${SOURCES}
                         bt
                         fatfs
                         xiaozhi-fonts
+                        # 直连模式（需求 v1.3）
+                        esp_http_server
+                        esp_http_client
+                        esp_wifi
+                        esp_timer
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
 

@@ -144,6 +144,8 @@ public:
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
+    // Direct-connect providers consume raw PCM16 instead of Opus frames.
+    void SetSendPcm(bool enable) { send_pcm_.store(enable); }
     void PlaySound(const std::string_view& sound);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
@@ -169,6 +171,8 @@ private:
     int decoder_sample_rate_ = 0;
     int decoder_duration_ms_ = OPUS_FRAME_DURATION_MS;
     int decoder_frame_size_ = 0;
+    // Last decoded stream was raw PCM16 (direct-connect) instead of Opus.
+    bool decoder_pcm_ = false;
     DebugStatistics debug_statistics_;
     int64_t last_encode_drop_log_time_ = 0;
     srmodel_list_t* models_list_ = nullptr;
@@ -207,6 +211,8 @@ private:
 #endif
     std::atomic<bool> service_stopped_{true};
     std::atomic<bool> audio_input_need_warmup_{false};
+    // Send mic audio as raw PCM16 (true) or Opus (false). Set by the protocol layer.
+    std::atomic<bool> send_pcm_{false};
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;
@@ -217,7 +223,7 @@ private:
     void OpusCodecTask();
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
     bool InitializeAudioEngine();
-    void SetDecodeSampleRate(int sample_rate, int frame_duration);
+    void SetDecodeSampleRate(int sample_rate, int frame_duration, bool pcm);
     void CheckAndUpdateAudioPowerState();
     bool IsPlaybackDrainedLocked() const;
     bool MarkPlaybackDrainedLocked();
