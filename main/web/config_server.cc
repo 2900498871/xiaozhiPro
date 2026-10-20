@@ -513,7 +513,7 @@ img.preview{max-width:100%;border-radius:8px;border:1px solid var(--line);margin
 </div>
 <div class="row switch"><label>允许打断</label><input type="checkbox" id="interrupt_enable"></div>
 <div class="btns">
-<button onclick="save()">保存配置</button>
+<button onclick="save()">保存 AI 配置</button>
 <button class="ghost" onclick="testConn()">测试连接</button>
 </div>
 </div>
@@ -538,7 +538,10 @@ img.preview{max-width:100%;border-radius:8px;border:1px solid var(--line);margin
 <option value="periodic">periodic（周期播报）</option>
 <option value="event">event（变化/异常播报）</option>
 </select></div>
-<div class="btns"><button class="ghost" onclick="refreshPreview()">刷新预览</button></div>
+<div class="btns">
+<button onclick="saveVision()">保存配置</button>
+<button class="ghost" onclick="refreshPreview()">刷新预览</button>
+</div>
 <img class="preview" id="preview" alt="camera preview">
 </div>
 
@@ -603,7 +606,13 @@ async function save(){
     language:document.getElementById('language').value,
     session_timeout:parseInt(document.getElementById('session_timeout').value)||60,
     interrupt_enable:document.getElementById('interrupt_enable').checked
-  },vision:{
+  }};
+  var r=await api('/api/config',body);
+  toast(r.ok?'AI 配置已保存':'保存失败：'+r.error,r.ok?false:true);
+  refresh();
+}
+function visionBody(){
+  return {
     enable:document.getElementById('v_enable').checked,
     width:parseInt(document.getElementById('v_width').value)||640,
     height:parseInt(document.getElementById('v_height').value)||480,
@@ -615,9 +624,11 @@ async function save(){
     frame_interval_ms:parseInt(document.getElementById('v_interval').value)||2000,
     announce_mode:document.getElementById('v_announce').value,
     auto_off_ms:parseInt(document.getElementById('v_auto_off').value)||0
-  }};
-  var r=await api('/api/config',body);
-  toast(r.ok?'已保存':'保存失败：'+r.error,r.ok?false:true);
+  };
+}
+async function saveVision(){
+  var r=await api('/api/config',{vision:visionBody()});
+  toast(r.ok?'摄像头配置已保存':'保存失败：'+r.error,r.ok?false:true);
   refresh();
 }
 async function testConn(){var body={llm:{provider:document.getElementById('provider').value,api_key:document.getElementById('api_key').value,model:document.getElementById('model').value,base_url:document.getElementById('base_url').value}};var r=await api('/api/test',body);toast(r.ok?r.message:'失败：'+r.error,!r.ok)}
