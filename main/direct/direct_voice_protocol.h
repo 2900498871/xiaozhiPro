@@ -70,4 +70,11 @@ private:
     std::vector<uint8_t> quiet_frame_;
     int64_t quiet_frame_us_ = 0;
     std::atomic<int64_t> last_activity_us_{0};
+
+    // periodic 模式的播报节流计数与 event 模式的帧变化检测（受 state_mutex_ 保护）
+    int periodic_frame_count_ = 0;
+    std::vector<uint8_t> last_event_sample_;
+    size_t last_event_size_ = 0;
+    bool FrameLooksChanged(const uint8_t* jpeg, size_t len);
+    void ResetVisionAnalysisState();
 };

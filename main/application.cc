@@ -11,6 +11,7 @@
 #include "text_glyph_payload.h"
 #include "ai_config.h"
 #include "direct/direct_voice_protocol.h"
+#include "display/ip_hint.h"
 #include "web/config_server.h"
 #include "vision/vision_module.h"
 
@@ -140,6 +141,9 @@ void Application::Initialize() {
                 std::string msg = Lang::Strings::CONNECTED_TO;
                 msg += data;
                 display->ShowNotification(msg.c_str(), 30000);
+                // 需求 FR-1.5：拿到 IP 后空闲态滚动显示配置页地址，直到网页被访问、
+                // 开始对话或超时。
+                IpHint::Show();
                 xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_CONNECTED);
                 break;
             }
@@ -147,7 +151,9 @@ void Application::Initialize() {
                 xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
                 break;
             case NetworkEvent::WifiConfigModeEnter:
-                // WiFi config mode enter is handled by WifiBoard internally
+                // 热点配网时 WifiBoard 自己显示热点名与 http://192.168.4.1，
+                // 这里退出 STA 引导，避免两条文案互相覆盖。
+                IpHint::Hide("wifi config mode");
                 break;
             case NetworkEvent::WifiConfigModeExit:
                 // WiFi config mode exit is handled by WifiBoard internally
@@ -283,6 +289,9 @@ void Application::Run() {
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
+
+            // 配置页地址引导：刷新 IP、检查超时与对话开始。
+            IpHint::Tick();
 
             // 直连模式：空闲超时后主动断开与 AI 服务商的会话，避免长时间空转。
             if (clock_ticks_ % 5 == 0 && protocol_ && GetDeviceState() == kDeviceStateIdle) {
@@ -848,6 +857,7 @@ void Application::HandleToggleChatEvent() {
     }
 
     if (state == kDeviceStateIdle) {
+        IpHint::Hide("start chat");
         ListeningMode mode = GetDefaultListeningMode();
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
@@ -908,6 +918,7 @@ void Application::HandleStartListeningEvent() {
     }
 
     if (state == kDeviceStateIdle) {
+        IpHint::Hide("start listening");
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
@@ -943,6 +954,8 @@ void Application::HandleWakeWordDetectedEvent() {
         return;
     }
 
+    // 需求 FR-1.5(c)：唤醒即退出配置页地址引导。
+    IpHint::Hide("wake word");
     auto state = GetDeviceState();
     auto wake_word = audio_service_.GetLastWakeWord();
     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
@@ -1059,6 +1072,8 @@ void Application::HandleStateChangedEvent() {
                 display->ClearChatMessages();  // Clear messages first
                 display->SetEmotion(
                     "neutral");  // Then set emotion (wechat mode checks child count)
+                // ClearChatMessages() 会一并清掉配置地址引导，回到空闲后补画。
+                IpHint::Redraw();
             }
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);

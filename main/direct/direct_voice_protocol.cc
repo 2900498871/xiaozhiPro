@@ -16,6 +16,9 @@
 #include "adapters/qwen_realtime.h"
 #include "adapters/doubao_realtime.h"
 #include "adapters/deepseek_adapter.h"
+#include "application.h"
+#include "board.h"
+#include "display.h"
 #include "vision/vision_module.h"
 
 #define TAG "DirectVoiceProtocol"
@@ -25,8 +28,11 @@ static std::unique_ptr<VoiceAdapter> CreateVoiceAdapter(const std::string& provi
         return std::make_unique<QwenRealtimeAdapter>();
     } else if (provider == "doubao") {
         return std::make_unique<DoubaoRealtimeAdapter>();
+    } else if (provider == "deepseek") {
+        return std::make_unique<DeepSeekAdapter>();
     }
-    return std::make_unique<DeepSeekAdapter>();
+    // 未知/空 provider：返回空，由上层报"未知服务商"，避免静默落到 DeepSeek 造成误导
+    return nullptr;
 }
 
 // 将 "打开摄像头,关闭摄像头" 拆成列表
@@ -69,7 +75,7 @@ bool DirectVoiceProtocol::OpenAudioChannel() {
     provider_ = cfg_.provider;
     CreateAdapter();
     if (!adapter_) {
-        SetError("无法创建语音适配器");
+        SetError("未知的服务商配置（支持 qwen/doubao/deepseek），请检查网页设置");
         return false;
     }
 
@@ -103,6 +109,7 @@ bool DirectVoiceProtocol::OpenAudioChannel() {
     }
     request_in_flight_.store(false);
     listening_.store(false);
+    ResetVisionAnalysisState();
 
     if (!adapter_->Connect(acfg)) {
         SetError("连接语音服务失败");
@@ -128,6 +135,7 @@ void DirectVoiceProtocol::CloseAudioChannel(bool send_goodbye) {
     }
     request_in_flight_.store(false);
     listening_.store(false);
+    ResetVisionAnalysisState();
     if (was_tts) EmitTts("stop");
 }
 
@@ -216,17 +224,30 @@ bool DirectVoiceProtocol::SendText(const std::string& text) {
 // 且不捕获协议对象，避免协议重建时访问已释放内存。
 static void VisionSwitchTask(void* arg) {
     auto* request = static_cast<std::pair<std::string, bool>*>(arg);
+    const bool enable = request->second;
     VisionConfig vcfg = VisionConfigLoad();
-    vcfg.enable = request->second;
+    vcfg.enable = enable;
     VisionConfigSave(vcfg);
-    if (request->second) {
-        bool ok = VisionModuleStart();
+    bool ok = true;
+    if (enable) {
+        ok = VisionModuleStart();
         ESP_LOGI(TAG, "vision on via voice: %s -> %d", request->first.c_str(), ok);
     } else {
         VisionModuleStop();
         ESP_LOGI(TAG, "vision off via voice: %s", request->first.c_str());
     }
     delete request;
+
+    // 需求 FR-5.2：摄像头状态变化给出屏幕反馈。
+    Application::GetInstance().Schedule([enable, ok]() {
+        auto display = Board::GetInstance().GetDisplay();
+        if (display == nullptr) return;
+        if (enable && !ok) {
+            display->ShowNotification("摄像头打开失败，请检查接线", 3000);
+        } else {
+            display->ShowNotification(enable ? "摄像头已打开" : "摄像头已关闭", 3000);
+        }
+    });
     vTaskDelete(nullptr);
 }
 
@@ -264,7 +285,8 @@ bool DirectVoiceProtocol::HandleVisionCommand(const std::string& text) {
 
     for (const auto& phrase : SplitPhrases(vcfg.command_phrases)) {
         if (!phrase.empty() && text.find(phrase) != std::string::npos) {
-            SnapAndAnalyze();
+            // 本函数运行在适配器接收线程，取帧/发送图像交给主任务，避免阻塞音频。
+            Application::GetInstance().SnapAndAnalyze();
             return true;
         }
     }
@@ -399,23 +421,84 @@ void DirectVoiceProtocol::OnAdapterState(const std::string& state) {
     }
 }
 
+void DirectVoiceProtocol::ResetVisionAnalysisState() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    periodic_frame_count_ = 0;
+    last_event_sample_.clear();
+    last_event_size_ = 0;
+}
+
+// event 模式的变化检测：按固定步长采样 JPEG 字节，与上一帧比较。
+// 只保留采样指纹，不缓存整帧，避免持续占用 PSRAM。
+bool DirectVoiceProtocol::FrameLooksChanged(const uint8_t* jpeg, size_t len) {
+    constexpr size_t kSamples = 256;
+    constexpr size_t kSampleStep = 97;  // 质数步长，避开 JPEG 头部固定字段
+    constexpr size_t kAvgDiffThreshold = 16;
+    constexpr size_t kSizeChangePercent = 15;
+
+    std::vector<uint8_t> sample;
+    sample.reserve(kSamples);
+    for (size_t i = 0; i < kSamples && i * kSampleStep < len; ++i) {
+        sample.push_back(jpeg[i * kSampleStep]);
+    }
+
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    bool changed = false;
+    if (!last_event_sample_.empty() && last_event_sample_.size() == sample.size()) {
+        size_t diff = 0;
+        for (size_t i = 0; i < sample.size(); ++i) {
+            diff += sample[i] > last_event_sample_[i] ? (sample[i] - last_event_sample_[i])
+                                                      : (last_event_sample_[i] - sample[i]);
+        }
+        const size_t avg_diff = diff / sample.size();
+        const size_t size_delta = len > last_event_size_ ? len - last_event_size_
+                                                         : last_event_size_ - len;
+        changed = avg_diff >= kAvgDiffThreshold ||
+                  size_delta * 100 >= last_event_size_ * kSizeChangePercent;
+    }
+
+    last_event_sample_ = std::move(sample);
+    last_event_size_ = len;
+    return changed;
+}
+
 void DirectVoiceProtocol::OnVisionFrame(const uint8_t* jpeg, size_t len) {
-    if (!adapter_ || !adapter_->IsConnected() || !jpeg || len == 0) return;
+    if (!jpeg || len == 0) return;
 
     VisionConfig vcfg = VisionConfigLoad();
     if (!vcfg.continuous_enable) return;
-    // quiet：不主动请求回复，仅缓存最近一帧；下次提交用户提问时一并发送。
-    if (vcfg.announce_mode == "quiet") {
-        if (len > 64 * 1024) return;
+
+    // 无论播报模式如何，都缓存最近一帧：用户随后提问（"现在看到什么"）时，
+    // SendStopListening() 会把这一帧随本轮输入一起提交给模型。
+    if (len <= 64 * 1024) {
         std::lock_guard<std::mutex> lock(state_mutex_);
         quiet_frame_.assign(jpeg, jpeg + len);
         quiet_frame_us_ = esp_timer_get_time();
-        return;
     }
+
+    if (!adapter_ || !adapter_->IsConnected()) return;
 
     // 正在采集用户语音：此时 RequestResponse 会 commit 并截断用户这句话。
     // 已有回复在处理中时也不再发起新的请求。
     if (listening_.load() || request_in_flight_.load()) return;
+
+    if (vcfg.announce_mode == "periodic") {
+        // 需求 FR-5.3：periodic 每 N 帧主动播报一次摘要（默认 5 帧 ≈ 10 秒）。
+        constexpr int kPeriodicAnnounceEvery = 5;
+        bool due = false;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            due = (++periodic_frame_count_ >= kPeriodicAnnounceEvery);
+            if (due) periodic_frame_count_ = 0;
+        }
+        if (!due) return;
+    } else if (vcfg.announce_mode == "event") {
+        // 仅在检测到画面显著变化时播报。
+        if (!FrameLooksChanged(jpeg, len)) return;
+    } else {
+        // quiet：静默分析，只缓存，不主动请求回复。
+        return;
+    }
 
     if (!adapter_->SendImage(jpeg, len)) return;
     last_activity_us_.store(esp_timer_get_time());

@@ -38,3 +38,7 @@ VisionConfig VisionConfigLoad();
 // 保存
 void LlmConfigSave(const LlmConfig& cfg);
 void VisionConfigSave(const VisionConfig& cfg);
+
+// 设备名称（NVS 命名空间 device / 键 name，需求 FR-2.2）
+std::string DeviceNameLoad();
+void DeviceNameSave(const std::string& name);

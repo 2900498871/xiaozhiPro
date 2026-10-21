@@ -79,6 +79,21 @@ VisionConfig VisionConfigLoad() {
     return cfg;
 }
 
+std::string DeviceNameLoad() {
+    Settings s("device", false);
+    return s.GetString("name", "");
+}
+
+void DeviceNameSave(const std::string& name) {
+    Settings s("device", true);
+    if (name.empty()) {
+        s.EraseKey("name");
+    } else {
+        s.SetString("name", name);
+    }
+    ESP_LOGI(TAG, "Device name saved: %s", name.c_str());
+}
+
 void VisionConfigSave(const VisionConfig& cfg) {
     Settings s("vision", true);
     s.SetBool("enable", cfg.enable);

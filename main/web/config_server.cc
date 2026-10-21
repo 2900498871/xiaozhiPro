@@ -1,5 +1,7 @@
 #include "config_server.h"
 
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -12,11 +14,15 @@
 #include <esp_wifi.h>
 #include <esp_system.h>
 #include <cJSON.h>
+#include <freertos/FreeRTOS.h>
 
 #include "ai_config.h"
 #include "application.h"
+#include "audio_codec.h"
 #include "board.h"
 #include "direct/direct_voice_protocol.h"
+#include "display.h"
+#include "display/ip_hint.h"
 #include "settings.h"
 #include "vision/vision_module.h"
 
@@ -120,34 +126,109 @@ static int ClampInt(int value, int min_value, int max_value) {
     return value;
 }
 
-// ---------------- API handlers ----------------
-
-static esp_err_t HandleStatus(httpd_req_t* req) {
-    cJSON* root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "ip", GetDeviceIp().c_str());
-    cJSON_AddStringToObject(root, "fw_version", GetFwVersion().c_str());
-    cJSON_AddStringToObject(root, "mac", GetMac().c_str());
-    cJSON_AddStringToObject(root, "uuid", Board::GetInstance().GetUuid().c_str());
-    cJSON_AddStringToObject(root, "ssid", GetSsid().c_str());
-    LlmConfig lcfg = LlmConfigLoad();
-    cJSON_AddStringToObject(root, "provider", lcfg.provider.c_str());
-    cJSON_AddBoolToObject(root, "session_active", s_protocol && s_protocol->IsAudioChannelOpened());
-    cJSON_AddBoolToObject(root, "camera_on", VisionModuleIsRunning());
-    char* str = cJSON_PrintUnformatted(root);
-    SendJson(req, str ? str : "{}");
-    free(str);
-    cJSON_Delete(root);
-    return ESP_OK;
+// 按 UTF-8 字符边界截断，避免中文名被切成半个字符后显示为乱码。
+static std::string Utf8Truncate(const std::string& text, size_t max_bytes) {
+    if (text.size() <= max_bytes) return text;
+    size_t len = max_bytes;
+    while (len > 0 && (static_cast<unsigned char>(text[len]) & 0xC0) == 0x80) {
+        --len;
+    }
+    return text.substr(0, len);
 }
 
-static esp_err_t HandleGetConfig(httpd_req_t* req) {
+// 在屏幕上给出操作反馈（HTTP/语音任务不能直接操作显示，交给主任务）。
+static void NotifyDisplay(const std::string& message) {
+    if (message.empty()) return;
+    Application::GetInstance().Schedule([message]() {
+        auto display = Board::GetInstance().GetDisplay();
+        if (display != nullptr) {
+            display->ShowNotification(message.c_str(), 3000);
+        }
+    });
+}
+
+// ---------------- 串口日志镜像（FR-6.4） ----------------
+// 固定环形缓冲，避免日志量随运行时间增长；读取时按时间顺序复制一份快照。
+static constexpr size_t kLogRingSize = 8192;
+static char s_log_ring[kLogRingSize];
+static size_t s_log_head = 0;  // 下一个写入位置
+static size_t s_log_len = 0;   // 有效字节数
+static portMUX_TYPE s_log_mux = portMUX_INITIALIZER_UNLOCKED;
+static vprintf_like_t s_prev_vprintf = nullptr;
+
+static int LogCapture(const char* fmt, va_list args) {
+    va_list copy;
+    va_copy(copy, args);
+    int ret = s_prev_vprintf != nullptr ? s_prev_vprintf(fmt, args) : vprintf(fmt, args);
+
+    char buf[256];
+    int n = vsnprintf(buf, sizeof(buf), fmt, copy);
+    va_end(copy);
+    if (n > 0) {
+        const size_t len =
+            static_cast<size_t>(n) < sizeof(buf) - 1 ? static_cast<size_t>(n) : sizeof(buf) - 1;
+        portENTER_CRITICAL(&s_log_mux);
+        for (size_t i = 0; i < len; ++i) {
+            s_log_ring[s_log_head] = buf[i];
+            s_log_head = (s_log_head + 1) % kLogRingSize;
+        }
+        s_log_len = s_log_len + len > kLogRingSize ? kLogRingSize : s_log_len + len;
+        portEXIT_CRITICAL(&s_log_mux);
+    }
+    return ret;
+}
+
+static std::string LogRead() {
+    // 先在临界区外完成 8KB 扩容，避免持有自旋锁时触发堆分配。
+    std::string out;
+    out.resize(kLogRingSize);
+    size_t len = 0;
+    portENTER_CRITICAL(&s_log_mux);
+    len = s_log_len;
+    const size_t start = (s_log_head + kLogRingSize - len) % kLogRingSize;
+    for (size_t i = 0; i < len; ++i) {
+        out[i] = s_log_ring[(start + i) % kLogRingSize];
+    }
+    portEXIT_CRITICAL(&s_log_mux);
+    out.resize(len);
+    return out;
+}
+
+static void LogClear() {
+    portENTER_CRITICAL(&s_log_mux);
+    s_log_head = 0;
+    s_log_len = 0;
+    portEXIT_CRITICAL(&s_log_mux);
+}
+
+static void LogHookInstall() {
+    if (s_prev_vprintf == nullptr) {
+        s_prev_vprintf = esp_log_set_vprintf(LogCapture);
+    }
+}
+
+static void LogHookRestore() {
+    if (s_prev_vprintf != nullptr) {
+        esp_log_set_vprintf(s_prev_vprintf);
+        s_prev_vprintf = nullptr;
+    }
+}
+
+// ---------------- 配置序列化 ----------------
+
+// export_mode=true 时输出可导入的完整配置（API Key 脱敏）；
+// 否则输出网页使用的配置，Key 只返回是否已设置。
+static cJSON* BuildConfigJson(bool export_mode) {
     LlmConfig lcfg = LlmConfigLoad();
     VisionConfig vcfg = VisionConfigLoad();
     cJSON* root = cJSON_CreateObject();
     cJSON* llm = cJSON_CreateObject();
     cJSON_AddStringToObject(llm, "provider", lcfg.provider.c_str());
-    // API Key 不回显，仅返回是否有 Key
-    cJSON_AddBoolToObject(llm, "has_api_key", !lcfg.api_key.empty());
+    if (export_mode) {
+        cJSON_AddStringToObject(llm, "api_key", lcfg.api_key.empty() ? "" : "********");
+    } else {
+        cJSON_AddBoolToObject(llm, "has_api_key", !lcfg.api_key.empty());
+    }
     cJSON_AddStringToObject(llm, "model", lcfg.model.c_str());
     cJSON_AddStringToObject(llm, "base_url", lcfg.base_url.c_str());
     cJSON_AddStringToObject(llm, "audio_format", lcfg.audio_format.c_str());
@@ -171,25 +252,16 @@ static esp_err_t HandleGetConfig(httpd_req_t* req) {
     cJSON_AddNumberToObject(vision, "auto_off_ms", vcfg.auto_off_ms);
     cJSON_AddItemToObject(root, "vision", vision);
 
-    char* str = cJSON_PrintUnformatted(root);
-    SendJson(req, str ? str : "{}");
-    free(str);
-    cJSON_Delete(root);
-    return ESP_OK;
+    cJSON* device = cJSON_CreateObject();
+    cJSON_AddStringToObject(device, "name", DeviceNameLoad().c_str());
+    auto codec = Board::GetInstance().GetAudioCodec();
+    cJSON_AddNumberToObject(device, "volume", codec != nullptr ? codec->output_volume() : 0);
+    cJSON_AddItemToObject(root, "device", device);
+    return root;
 }
 
-static esp_err_t HandlePostConfig(httpd_req_t* req) {
-    std::string body;
-    if (!ReadBody(req, body)) {
-        SendJson(req, "{\"ok\":false,\"error\":\"empty or oversized body\"}", HTTPD_400);
-        return ESP_OK;
-    }
-    cJSON* root = cJSON_Parse(body.c_str());
-    if (!root) {
-        SendJson(req, "{\"ok\":false,\"error\":\"invalid json\"}", HTTPD_400);
-        return ESP_OK;
-    }
-
+// 校验并写入 llm/vision/device 配置；成功返回 true，失败时 error 为提示文本。
+static bool ApplyConfigJson(cJSON* root, std::string& error) {
     LlmConfig lcfg = LlmConfigLoad();
     cJSON* llm = cJSON_GetObjectItem(root, "llm");
     if (llm) {
@@ -200,18 +272,17 @@ static esp_err_t HandlePostConfig(httpd_req_t* req) {
         std::string base_url = JsonGetString(llm, "base_url", lcfg.base_url);
         if (!base_url.empty() && base_url.rfind("wss://", 0) != 0 &&
             base_url.rfind("ws://", 0) != 0) {
-            cJSON_Delete(root);
-            SendJson(req, "{\"ok\":false,\"error\":\"base_url must start with wss:// or ws://\"}",
-                     HTTPD_400);
-            return ESP_OK;
+            error = "base_url must start with wss:// or ws://";
+            return false;
         }
         lcfg.base_url = base_url;
         std::string key = JsonGetString(llm, "api_key", "");
         const bool clear_key = JsonGetBool(llm, "clear_api_key", false);
         if (clear_key) {
             lcfg.api_key.clear();
-        } else if (!key.empty()) {
-            lcfg.api_key = key;  // 空值表示不修改（页面不回显）
+        } else if (!key.empty() && key != "********") {
+            // 空值或脱敏占位符表示保留原 Key（页面/导出文件不回显）。
+            lcfg.api_key = key;
         }
         lcfg.model = JsonGetString(llm, "model", lcfg.model);
         lcfg.audio_format = JsonGetString(llm, "audio_format", lcfg.audio_format);
@@ -224,6 +295,21 @@ static esp_err_t HandlePostConfig(httpd_req_t* req) {
         if (clear_key) {
             Settings llm_settings("llm", true);
             llm_settings.EraseKey("api_key");
+        }
+    }
+
+    cJSON* device = cJSON_GetObjectItem(root, "device");
+    if (device) {
+        std::string name = JsonGetString(device, "name", DeviceNameLoad());
+        DeviceNameSave(Utf8Truncate(name, 32));
+        cJSON* volume = cJSON_GetObjectItem(device, "volume");
+        if (volume != nullptr) {
+            auto codec = Board::GetInstance().GetAudioCodec();
+            if (codec != nullptr) {
+                const int current_volume = codec->output_volume();
+                codec->SetOutputVolume(
+                    ClampInt(JsonGetInt(device, "volume", current_volume), 0, 100));
+            }
         }
     }
 
@@ -257,8 +343,6 @@ static esp_err_t HandlePostConfig(httpd_req_t* req) {
         VisionConfigSave(vcfg);
     }
 
-    cJSON_Delete(root);
-
     // 立即应用摄像头开关；分辨率/质量变化需要重启采集。
     if (vcfg.enable) {
         if (!VisionModuleIsRunning()) {
@@ -270,8 +354,109 @@ static esp_err_t HandlePostConfig(httpd_req_t* req) {
     } else if (VisionModuleIsRunning()) {
         VisionModuleStop();
     }
+    return true;
+}
 
+// ---------------- API handlers ----------------
+
+static esp_err_t HandleStatus(httpd_req_t* req) {
+    IpHint::MarkConfigured();
+    IpHint::Hide("config page accessed");
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "ip", GetDeviceIp().c_str());
+    cJSON_AddStringToObject(root, "fw_version", GetFwVersion().c_str());
+    cJSON_AddStringToObject(root, "mac", GetMac().c_str());
+    cJSON_AddStringToObject(root, "uuid", Board::GetInstance().GetUuid().c_str());
+    cJSON_AddStringToObject(root, "ssid", GetSsid().c_str());
+    cJSON_AddStringToObject(root, "device_name", DeviceNameLoad().c_str());
+    LlmConfig lcfg = LlmConfigLoad();
+    cJSON_AddStringToObject(root, "provider", lcfg.provider.c_str());
+    cJSON_AddBoolToObject(root, "session_active", s_protocol && s_protocol->IsAudioChannelOpened());
+    cJSON_AddBoolToObject(root, "camera_on", VisionModuleIsRunning());
+    char* str = cJSON_PrintUnformatted(root);
+    SendJson(req, str ? str : "{}");
+    free(str);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t HandleGetConfig(httpd_req_t* req) {
+    cJSON* root = BuildConfigJson(false);
+    char* str = cJSON_PrintUnformatted(root);
+    SendJson(req, str ? str : "{}");
+    free(str);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t HandleExportConfig(httpd_req_t* req) {
+    cJSON* root = BuildConfigJson(true);
+    char* str = cJSON_PrintUnformatted(root);
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=xiaozhi-config.json");
+    SendJson(req, str ? str : "{}");
+    free(str);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t HandleImportConfig(httpd_req_t* req) {
+    std::string body;
+    if (!ReadBody(req, body, 16384)) {
+        SendJson(req, "{\"ok\":false,\"error\":\"empty or oversized body\"}", HTTPD_400);
+        return ESP_OK;
+    }
+    cJSON* root = cJSON_Parse(body.c_str());
+    if (!root) {
+        SendJson(req, "{\"ok\":false,\"error\":\"invalid json\"}", HTTPD_400);
+        return ESP_OK;
+    }
+    std::string error;
+    const bool ok = ApplyConfigJson(root, error);
+    cJSON_Delete(root);
+    if (!ok) {
+        std::string msg = "{\"ok\":false,\"error\":\"" + error + "\"}";
+        SendJson(req, msg.c_str(), HTTPD_400);
+        return ESP_OK;
+    }
+    SendJson(req, "{\"ok\":true,\"message\":\"配置已导入\"}");
+    return ESP_OK;
+}
+
+static esp_err_t HandlePostConfig(httpd_req_t* req) {
+    std::string body;
+    if (!ReadBody(req, body)) {
+        SendJson(req, "{\"ok\":false,\"error\":\"empty or oversized body\"}", HTTPD_400);
+        return ESP_OK;
+    }
+    cJSON* root = cJSON_Parse(body.c_str());
+    if (!root) {
+        SendJson(req, "{\"ok\":false,\"error\":\"invalid json\"}", HTTPD_400);
+        return ESP_OK;
+    }
+    std::string error;
+    const bool ok = ApplyConfigJson(root, error);
+    cJSON_Delete(root);
+    if (!ok) {
+        std::string msg = "{\"ok\":false,\"error\":\"" + error + "\"}";
+        SendJson(req, msg.c_str(), HTTPD_400);
+        return ESP_OK;
+    }
     SendJson(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t HandleLogs(httpd_req_t* req) {
+    char query[32] = {};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char value[8] = {};
+        if (httpd_query_key_value(query, "clear", value, sizeof(value)) == ESP_OK) {
+            LogClear();
+        }
+    }
+    std::string logs = LogRead();
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, logs.c_str(), logs.size());
     return ESP_OK;
 }
 
@@ -373,7 +558,9 @@ static esp_err_t HandleCamera(httpd_req_t* req) {
         VisionConfig vcfg = VisionConfigLoad();
         vcfg.enable = true;
         VisionConfigSave(vcfg);
+        // 需求 FR-5.2：摄像头状态变化给出屏幕反馈（显示操作排到主任务执行）。
         bool ok = VisionModuleStart();
+        NotifyDisplay(ok ? "摄像头已打开" : "摄像头打开失败，请检查接线");
         SendJson(req, ok ? "{\"ok\":true,\"message\":\"摄像头已打开\"}"
                          : "{\"ok\":false,\"error\":\"摄像头打开失败（检查接线）\"}");
     } else if (action == "close") {
@@ -381,6 +568,7 @@ static esp_err_t HandleCamera(httpd_req_t* req) {
         vcfg.enable = false;
         VisionConfigSave(vcfg);
         VisionModuleStop();
+        NotifyDisplay("摄像头已关闭");
         SendJson(req, "{\"ok\":true,\"message\":\"摄像头已关闭\"}");
     } else if (action == "snap") {
         Application::GetInstance().SnapAndAnalyze();
@@ -404,6 +592,10 @@ static esp_err_t HandleReset(httpd_req_t* req) {
         // 服务器模式遗留配置，直连模式不再使用。
         Settings wifi("wifi", true);
         wifi.EraseKey("ota_url");
+    }
+    {
+        Settings device("device", true);
+        device.EraseAll();
     }
     SendJson(req, "{\"ok\":true,\"message\":\"已恢复默认配置，设备即将重启\"}");
     Application::GetInstance().Schedule([]() { Application::GetInstance().Reboot(); });
@@ -469,6 +661,8 @@ button:disabled{opacity:.5;cursor:not-allowed}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 @media(max-width:560px){.grid2{grid-template-columns:1fr}}
 img.preview{max-width:100%;border-radius:8px;border:1px solid var(--line);margin-top:10px;display:none}
+#logs{background:#0b1220;border:1px solid var(--line);border-radius:8px;padding:10px;font:12px/1.5 ui-monospace,Consolas,monospace;color:#b9c4d8;max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-all;margin-top:10px}
+.muted{color:var(--sub);font-size:12px}
 </style>
 </head>
 <body>
@@ -482,6 +676,9 @@ img.preview{max-width:100%;border-radius:8px;border:1px solid var(--line);margin
 <div class="card">
 <h2>设备状态</h2>
 <div class="row"><label>WiFi</label><span class="status" id="wifi">--</span></div>
+<div class="row"><label>设备名称</label><span class="status" id="devname">--</span></div>
+<div class="row"><label>MAC</label><span class="status" id="mac">--</span></div>
+<div class="row"><label>UUID</label><span class="status" id="uuid">--</span></div>
 <div class="row"><label>会话</label><span class="status"><span class="dot" id="sessDot"></span><span id="sess">未连接</span></span></div>
 <div class="row"><label>摄像头</label><span class="status"><span class="dot" id="camDot"></span><span id="cam">关闭</span></span></div>
 <div class="btns">
@@ -494,16 +691,30 @@ img.preview{max-width:100%;border-radius:8px;border:1px solid var(--line);margin
 </div>
 
 <div class="card">
+<h2>设备参数</h2>
+<div class="row"><label>设备名称</label><input type="text" id="dev_name" maxlength="32" placeholder="给小智起个名字"></div>
+<div class="row"><label>输出音量</label><input type="number" id="dev_volume" min="0" max="100"></div>
+<div class="btns">
+<button class="ghost" onclick="saveDevice()">保存设备参数</button>
+</div>
+</div>
+
+<div class="card">
 <h2>AI 服务商（纯直连，无服务器）</h2>
 <div class="row"><label>服务商</label>
-<select id="provider">
+<select id="provider" onchange="providerChanged()">
 <option value="qwen">阿里千问（Qwen-Omni Realtime）</option>
 <option value="doubao">字节豆包（端到端实时语音）</option>
 <option value="deepseek" disabled>DeepSeek（预留，待语音 API）</option>
 </select></div>
 <div class="row"><label>API Key</label><input type="password" id="api_key" placeholder="留空表示不修改"></div>
 <div class="row switch"><label>清除已保存的 Key</label><input type="checkbox" id="clear_key"></div>
-<div class="row"><label>模型</label><input type="text" id="model" placeholder="qwen-omni-turbo-realtime"></div>
+<div class="row"><label>模型</label><input type="text" id="model" list="model_list" placeholder="qwen-omni-turbo-realtime"></div>
+<datalist id="model_list">
+<option value="qwen-omni-turbo-realtime">
+<option value="qwen2.5-omni-7b">
+<option value="doubao-realtime-3.0">
+</datalist>
 <div class="row"><label>接入端点</label><input type="text" id="base_url"></div>
 <div class="grid2">
 <div class="row"><label>输出格式</label><select id="audio_format"><option>pcm</option><option>wav</option><option>ogg_opus</option></select></div>
@@ -516,6 +727,8 @@ img.preview{max-width:100%;border-radius:8px;border:1px solid var(--line);margin
 <button onclick="save()">保存 AI 配置</button>
 <button class="ghost" onclick="testConn()">测试连接</button>
 </div>
+<span class="muted">API Key 明文保存在设备 NVS 中，页面不回显；局域网 HTTP 无加密。</span>
+<br><span class="muted">唤醒词在编译期确定，网页不可修改；视觉能力当前仅千问支持。</span>
 </div>
 
 <div class="card">
@@ -546,11 +759,27 @@ img.preview{max-width:100%;border-radius:8px;border:1px solid var(--line);margin
 </div>
 
 <div class="card">
+<h2>运行日志</h2>
+<span class="muted">串口日志镜像，仅保留最近 8KB，用于排障。</span>
+<pre id="logs">点击「刷新日志」查看</pre>
+<div class="btns">
+<button class="ghost" onclick="loadLogs()">刷新日志</button>
+<button class="ghost" onclick="clearLogs()">清空日志</button>
+</div>
+</div>
+
+<div class="card">
 <h2>运维</h2>
 <div class="btns">
+<button onclick="saveAllAndReboot()">保存全部并重启</button>
+<button class="ghost" onclick="saveAll()">仅保存全部</button>
+<button class="ghost" onclick="exportConfig()">导出配置</button>
+<button class="ghost" onclick="document.getElementById('import_file').click()">导入配置</button>
+<input type="file" id="import_file" accept="application/json,.json" style="display:none" onchange="importConfig(this)">
 <button class="ghost" onclick="resetConfig()">恢复默认配置并重启</button>
 <button class="danger" onclick="reboot()">重启设备</button>
 </div>
+<span class="muted">导出文件中的 API Key 已脱敏；导入时 Key 为 ******** 或留空表示保留设备现有 Key。</span>
 </div>
 </div>
 
@@ -563,6 +792,10 @@ async function refresh(){
     var s=await api('/api/status');
     document.getElementById('ip').textContent='IP: '+s.ip;
     document.getElementById('fw').textContent=s.fw_version;
+    document.getElementById('wifi').textContent=s.ssid||'--';
+    document.getElementById('mac').textContent=s.mac||'--';
+    document.getElementById('uuid').textContent=s.uuid||'--';
+    document.getElementById('devname').textContent=s.device_name||'(未命名)';
     var sd=document.getElementById('sessDot'),sc=document.getElementById('sess');
     sd.className='dot '+(s.session_active?'on':'off');sc.textContent=s.session_active?'已连接('+s.provider+')':'未连接';
     var cd=document.getElementById('camDot'),cc=document.getElementById('cam');
@@ -592,10 +825,26 @@ async function loadConfig(){
     document.getElementById('v_auto_off').value=c.vision.auto_off_ms;
     document.getElementById('v_continuous').checked=c.vision.continuous_enable;
     document.getElementById('v_announce').value=c.vision.announce_mode;
+    document.getElementById('dev_name').value=(c.device&&c.device.name)||'';
+    document.getElementById('dev_volume').value=(c.device&&c.device.volume!=null)?c.device.volume:70;
   }catch(e){toast('加载配置失败',true)}
 }
-async function save(){
-  var body={llm:{
+// 服务商默认值（FR-3.2）：切换服务商时带出官方端点与推荐模型。
+var PROVIDER_DEFAULTS={
+  qwen:{model:'qwen-omni-turbo-realtime',url:'wss://dashscope.aliyuncs.com/api-ws/v1/realtime',format:'pcm',voice:'Chelsie',lang:'zh'},
+  doubao:{model:'doubao-realtime-3.0',url:'wss://openspeech.bytedance.com/api/v3/realtime_voice',format:'pcm',voice:'',lang:'zh'}
+};
+function providerChanged(){
+  var d=PROVIDER_DEFAULTS[document.getElementById('provider').value];
+  if(!d)return;
+  document.getElementById('model').value=d.model;
+  document.getElementById('base_url').value=d.url;
+  document.getElementById('audio_format').value=d.format;
+  document.getElementById('voice').value=d.voice;
+  document.getElementById('language').value=d.lang;
+}
+function llmBody(){
+  return {
     provider:document.getElementById('provider').value,
     api_key:document.getElementById('api_key').value,
     clear_api_key:document.getElementById('clear_key').checked,
@@ -606,10 +855,35 @@ async function save(){
     language:document.getElementById('language').value,
     session_timeout:parseInt(document.getElementById('session_timeout').value)||60,
     interrupt_enable:document.getElementById('interrupt_enable').checked
-  }};
-  var r=await api('/api/config',body);
+  };
+}
+function deviceBody(){
+  return {
+    name:document.getElementById('dev_name').value,
+    volume:parseInt(document.getElementById('dev_volume').value)
+  };
+}
+async function save(){
+  var r=await api('/api/config',{llm:llmBody()});
   toast(r.ok?'AI 配置已保存':'保存失败：'+r.error,r.ok?false:true);
   refresh();
+}
+async function saveDevice(){
+  var r=await api('/api/config',{device:deviceBody()});
+  toast(r.ok?'设备参数已保存':'保存失败：'+r.error,r.ok?false:true);
+  refresh();
+}
+async function saveAll(){
+  var r=await api('/api/config',{llm:llmBody(),vision:visionBody(),device:deviceBody()});
+  if(r.ok)refresh();
+  return r;
+}
+async function saveAllAndReboot(){
+  if(!confirm('保存全部配置并重启设备？'))return;
+  var r=await saveAll();
+  if(!r.ok){toast('保存失败：'+r.error,true);return}
+  toast('配置已保存，设备正在重启');
+  await api('/api/reboot',{});
 }
 function visionBody(){
   return {
@@ -637,13 +911,30 @@ async function cam(a){var r=await api('/api/camera',{action:a});toast(r.message|
 function refreshPreview(){var img=document.getElementById('preview');img.src='/api/preview?t='+Date.now();img.style.display='block'}
 async function resetConfig(){if(!confirm('确定恢复默认配置？设备将重启。'))return;var r=await api('/api/reset',{});toast(r.message||r.error,!r.ok)}
 async function reboot(){if(!confirm('确定重启设备？'))return;var r=await api('/api/reboot',{});toast(r.message||r.error,!r.ok)}
-refresh();loadConfig();setInterval(refresh,10000);
+function exportConfig(){fetch('/api/export').then(function(r){return r.blob()}).then(function(b){var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='xiaozhi-config.json';document.body.appendChild(a);a.click();document.body.removeChild(a);setTimeout(function(){URL.revokeObjectURL(a.href)},1000)})}
+async function importConfig(input){
+  var file=input.files&&input.files[0];
+  if(!file)return;
+  try{
+    var obj=JSON.parse(await file.text());
+    var r=await api('/api/import',obj);
+    toast(r.ok?'配置已导入':'导入失败：'+r.error,!r.ok);
+    if(r.ok){await loadConfig();refresh()}
+  }catch(e){toast('导入失败：文件不是有效的 JSON',true)}
+  input.value='';
+}
+async function loadLogs(){try{var r=await fetch('/api/logs');var t=await r.text();var box=document.getElementById('logs');box.textContent=t||'(暂无日志)';box.scrollTop=box.scrollHeight}catch(e){toast('读取日志失败',true)}}
+async function clearLogs(){try{await fetch('/api/logs?clear=1');document.getElementById('logs').textContent='(暂无日志)'}catch(e){}}
+refresh();loadConfig();loadLogs();setInterval(refresh,10000);
 </script>
 </body>
 </html>
 )HTML";
 
 static esp_err_t HandlePage(httpd_req_t* req) {
+    // 需求 FR-1.5(a)：配置网页被访问后退出屏幕 IP 引导，并记住设置已完成。
+    IpHint::MarkConfigured();
+    IpHint::Hide("config page accessed");
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr(req, PAGE_HTML);
     return ESP_OK;
@@ -668,10 +959,14 @@ bool ConfigServerInit(DirectVoiceProtocol* protocol) {
     cfg.server_port = 80;
     // /api/test 会在此任务内执行 HTTPS 请求（TLS 握手栈开销较大）。
     cfg.stack_size = 10240;
-    cfg.max_uri_handlers = 16;
+    cfg.max_uri_handlers = 20;
+
+    // 串口日志镜像（FR-6.4）必须在 httpd 启动前安装，才能捕获启动日志。
+    LogHookInstall();
 
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd start failed");
+        LogHookRestore();
         return false;
     }
 
@@ -687,6 +982,10 @@ bool ConfigServerInit(DirectVoiceProtocol* protocol) {
     RegisterHandler(s_server, "/api/preview", HTTP_GET, HandleCameraPreview);
     RegisterHandler(s_server, "/api/reset", HTTP_POST, HandleReset);
     RegisterHandler(s_server, "/api/reboot", HTTP_POST, HandleReboot);
+    // 配置导出/导入（FR-6.3）与串口日志镜像（FR-6.4）
+    RegisterHandler(s_server, "/api/export", HTTP_GET, HandleExportConfig);
+    RegisterHandler(s_server, "/api/import", HTTP_POST, HandleImportConfig);
+    RegisterHandler(s_server, "/api/logs", HTTP_GET, HandleLogs);
 
     ESP_LOGI(TAG, "config server started on port 80");
     return true;
@@ -697,5 +996,6 @@ void ConfigServerDeinit() {
         httpd_stop(s_server);
         s_server = nullptr;
     }
+    LogHookRestore();
     s_protocol = nullptr;
 }
