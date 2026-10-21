@@ -6,6 +6,7 @@
 
 bool DeepSeekAdapter::Connect(const VoiceAdapterConfig& cfg) {
     (void)cfg;
+    ESP_LOGW(TAG, "DeepSeek 语音 API 尚未开放，连接被拒绝");
     if (on_error) on_error("DeepSeek 语音 API 尚未开放，当前仅支持千问与豆包");
     if (on_state) on_state("closed");
     return false;
